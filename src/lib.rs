@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 pub mod network;
 pub mod node;
+pub mod protocols;
 
 
 #[cfg(test)]

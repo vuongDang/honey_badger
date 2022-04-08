@@ -1,10 +1,15 @@
 use distributed::network::Network;
-use log::trace;
+use log::{trace, warn};
 
 fn main() {
     pretty_env_logger::init();
-    println!("Starting...");
-    let network = Network::new(10);
+    trace!("Starting...");
+    let mut network = Network::new(10, 3, 0);
     trace!("Network created...");
-    network.run();
+    let (success, results) = network.bracha_broadcast(7, 0);
+    if success {
+        trace!("Bracha broadcast successful: {:?}", results)
+    } else {
+        warn!("Bracha broadcast failed: {:?}", results)
+    }
 }

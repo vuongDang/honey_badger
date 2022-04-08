@@ -1,25 +1,28 @@
 use crate::node::*;
-use log::{trace, warn};
+use crate::protocols::bracha_broadcast::BroadcastMessage;
+use log::{debug, trace, warn};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time;
-use std::fmt;
 
 pub const NETWORK_ID: NodeId = 10000;
 pub type Value = usize;
 
-#[derive(Debug)]
-pub enum Message {
-    VALUE(Value),
+#[derive(Debug, Clone)]
+pub(crate) enum Message {
     BROADCAST(BroadcastMessage),
-    END,
+
+    // Sent by the network: node has to terminate
+    // Sent by a node: protocol has finished and node delivers this value
+    END(Value),
 }
 use Message::*;
 
 unsafe impl Send for Message {}
 unsafe impl Sync for Message {}
 
-pub struct NetworkMessage {
+pub(crate) struct NetworkMessage {
     pub from: NodeId,
     pub to: NodeId,
     pub msg: Message,
@@ -56,62 +59,145 @@ pub struct Network {
     num_nodes: usize,
     // Nodes of the network, node id corresponds to its index
     nodes: HashMap<NodeId, (Node, Sender<NetworkMessage>)>,
+    node_behaviours: HashMap<Behaviour, Vec<NodeId>>,
     rx: Receiver<NetworkMessage>,
     time_limit: Option<time::Duration>,
 }
 
 impl Network {
     /// Create new network with `num_nodes` nodes
-    pub fn new(num_nodes: usize) -> Self {
+    pub fn new(num_nodes: usize, num_faulty: usize, num_malicious: usize) -> Self {
+        // Number of "bad" nodes shall be less than a third of the nodes
+        assert!(((num_faulty + num_malicious) as f32) < (num_nodes as f32) / 3.0);
 
+        let num_good = num_nodes - num_faulty - num_malicious;
         let mut nodes = HashMap::new();
         let (tx, network_rx): (Sender<NetworkMessage>, Receiver<NetworkMessage>) = channel();
 
+        let mut good_nodes = vec![];
+        let mut faulty_nodes = vec![];
+        let mut malicious_nodes = vec![];
         for id in 0..num_nodes {
             let (network_tx, rx): (Sender<NetworkMessage>, Receiver<NetworkMessage>) = channel();
             let mut neighbour_nodes = (0..num_nodes).collect::<Vec<NodeId>>();
             neighbour_nodes.remove(id);
-            let node = Node::new(id, tx.clone(), rx, Behaviour::Good, neighbour_nodes);
+            let behaviour = if id < num_good {
+                good_nodes.push(id);
+                Behaviour::Good
+            } else if id < num_good + num_faulty {
+                faulty_nodes.push(id);
+                Behaviour::Faulty
+            } else {
+                malicious_nodes.push(id);
+                Behaviour::Malicious
+            };
+            let node = Node::new(id, tx.clone(), rx, behaviour, neighbour_nodes);
             nodes.insert(id, (node, network_tx));
         }
+
+        let mut node_behaviours = HashMap::new();
+        node_behaviours.insert(Behaviour::Good, good_nodes);
+        node_behaviours.insert(Behaviour::Faulty, faulty_nodes);
+        node_behaviours.insert(Behaviour::Malicious, malicious_nodes);
+
         Network {
             num_nodes,
             nodes,
+            node_behaviours,
             rx: network_rx,
             time_limit: None,
         }
     }
 
-    pub fn run(mut self) {
+    pub fn bracha_broadcast(
+        &mut self,
+        v: Value,
+        leader_node: NodeId,
+    ) -> (bool, HashMap<NodeId, Value>) {
         // Start a broadcast
-        let v = 7;
-        let leader_node = 0;
         if let Some((node, tx)) = self.nodes.get(&leader_node) {
             let bc_msg = Message::BROADCAST(BroadcastMessage::BC_LEADER(v));
             let msg = NetworkMessage::new(NETWORK_ID, node.id, bc_msg);
             trace!("{:?}", msg);
             tx.send(msg);
         }
+        let results = self.run_network();
 
-        let mut num_running_nodes = self.num_nodes;
+        // Termination: all honnest nodes have terminated
+        let termination =
+            results.len() == self.node_behaviours.get(&Behaviour::Good).unwrap().len();
+
+        // Agreement: all honnest nodes output the same value
+        let first = results.values().next().unwrap();
+        let agreement = results.values().all(|res| res == first);
+
+        // Validity: outputs of honnest nodes are equal to broadcasted value
+        let validity = agreement && *first == v;
+
+        (termination && agreement && validity, results)
+    }
+
+    fn run_network(&mut self) -> HashMap<NodeId, Value> {
+        let mut good_running_nodes = self.node_behaviours.get(&Behaviour::Good).unwrap().len();
+        let mut results = HashMap::new();
         loop {
             let network_msg = self.rx.recv().unwrap();
             match network_msg.msg {
-                // Node has terminated
-                END => {
+                // Node has terminated and outputs v
+                END(v) => {
                     let node_id = network_msg.from;
+
+                    // Store result of the node
+                    results.insert(node_id, v);
+
                     let (node, _) = self
                         .nodes
                         .remove(&node_id)
                         .expect("Can't terminate a node twice");
+
                     node.thread
                         .join()
                         .expect(&format!("oops, thread {} panicked", node.id));
 
-                    warn!("Thread {} has terminated", node.id);
-                    num_running_nodes = num_running_nodes - 1;
-                    if num_running_nodes == 0 {
-                        break;
+                    if self
+                        .node_behaviours
+                        .get(&Behaviour::Good)
+                        .unwrap()
+                        .contains(&node_id)
+                    {
+                        // If a good node terminates
+                        good_running_nodes = good_running_nodes - 1;
+
+                        if good_running_nodes == 0 {
+                            // If there are no more good nodes
+                            // Send a termination message to all the bad nodes
+
+                            warn!(
+                                "Good nodes {:?} have terminated",
+                                self.node_behaviours.get(&Behaviour::Good).unwrap()
+                            );
+                            let mut bad_nodes = self
+                                .node_behaviours
+                                .get(&Behaviour::Faulty)
+                                .unwrap()
+                                .clone();
+                            bad_nodes.append(
+                                self.node_behaviours.get_mut(&Behaviour::Malicious).unwrap(),
+                            );
+
+                            // Send termination message to all bad nodes
+                            for id in bad_nodes.iter() {
+                                let (_, tx) = self.nodes.get(&id).unwrap();
+                                tx.send(NetworkMessage::new(NETWORK_ID, *id, END(0)));
+                            }
+
+                            // Wait for the bad nodes to end
+                            for id in bad_nodes {
+                                let (node, _) = self.nodes.remove(&id).unwrap();
+                                node.thread.join().unwrap();
+                            }
+                            break;
+                        }
                     }
                 }
 
@@ -123,10 +209,11 @@ impl Network {
                             "[NETWORK ERROR] Trying to send message to terminated node.\n\t{:?}",
                             network_msg
                         ));
-                    tx.send(network_msg);
+                        tx.send(network_msg);
                     }
                 }
             }
         }
+        results
     }
 }
