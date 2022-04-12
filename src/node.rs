@@ -7,15 +7,27 @@ use std::thread::{self, JoinHandle};
 
 pub type NodeId = usize;
 
-// Faulty nodes stop sending message after FAULTY_AFTER messages
-const FAULTY_AFTER: usize = 0;
+// Faulty nodes stop sending message after SILENT_AFTER messages
+const SILENT_AFTER: usize = 0;
+pub(crate) const MALICIOUS_VALUE: Value = 0;
 
 #[derive(Clone, Hash, PartialEq, Eq, Debug)]
-pub(crate) enum Behaviour {
+pub enum Behaviour {
     Good,
-    Faulty,
-    Malicious,
+    Malicious(MaliciousKind),
 }
+use Behaviour::*;
+
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+pub enum MaliciousKind {
+    // Stop sending message after SILENT_AFTER messages
+    Silent,
+    // Send random message
+    Random,
+    // Does the same as other nodes but with another value
+    Mirror,
+}
+use MaliciousKind::*;
 
 const DEBUG_NODES: [NodeId; 2] = [0, 1];
 
@@ -36,14 +48,14 @@ impl Node {
     ) -> Node {
         // Parameters
         let num_nodes = neighbour_nodes.len() + 1;
-        // Number of faulty nodes must be inferior to 1/3
-        let max_faulty_nodes = num_nodes / 3;
-        let min_honnest_nodes = num_nodes - max_faulty_nodes;
+        // Number of malicious nodes must be inferior to 1/3
+        let max_malicious_nodes = num_nodes / 3;
+        let min_honnest_nodes = num_nodes - max_malicious_nodes;
         let mut node = NodeInternals {
             id,
             behaviour: behaviour.clone(),
             num_nodes,
-            max_faulty_nodes,
+            max_malicious_nodes,
             min_honnest_nodes,
             neighbour_nodes,
             tx,
@@ -95,7 +107,7 @@ pub(crate) struct NodeInternals {
     pub(crate) id: NodeId,
     pub(crate) behaviour: Behaviour,
     pub(crate) num_nodes: usize,
-    pub(crate) max_faulty_nodes: usize,
+    pub(crate) max_malicious_nodes: usize,
     pub(crate) min_honnest_nodes: usize,
     pub(crate) neighbour_nodes: Vec<NodeId>,
     pub(crate) tx: Sender<NetworkMessage>,
@@ -109,15 +121,22 @@ impl NodeInternals {
     /// Returns true to wait for new messages, false to terminate the node
     fn handle_msg(&mut self, msg: NetworkMessage, num_msg: usize) -> ProtocolState {
         match msg.msg {
-            BROADCAST(bc_msg) => match self.behaviour {
-                Behaviour::Good => handle_broadcast(self, msg.from, bc_msg),
-                Behaviour::Faulty => {
-                    if num_msg < FAULTY_AFTER {
-                        return handle_broadcast(self, msg.from, bc_msg);
+            BROADCAST(bc_msg) => match &self.behaviour {
+                Good => handle_broadcast(self, msg.from, bc_msg),
+                Malicious(kind) =>
+                    match kind {
+                        Silent => {
+                            if num_msg < SILENT_AFTER {
+                                return handle_broadcast(self, msg.from, bc_msg);
+                            }
+                            ProtocolState::InProcess
+                        }
+
+                        Random => random_broadcast(self, msg.from , bc_msg),
+
+                        Mirror => handle_broadcast(self, msg.from, bc_msg.malicious()),
                     }
-                    ProtocolState::InProcess
-                }
-                Behaviour::Malicious => ProtocolState::InProcess,
+
             },
 
             // Network asks the node to terminate

@@ -66,16 +66,15 @@ pub struct Network {
 
 impl Network {
     /// Create new network with `num_nodes` nodes
-    pub fn new(num_nodes: usize, num_faulty: usize, num_malicious: usize) -> Self {
+    pub fn new(num_nodes: usize, num_malicious: usize, kind: MaliciousKind) -> Self {
         // Number of "bad" nodes shall be less than a third of the nodes
-        assert!(((num_faulty + num_malicious) as f32) < (num_nodes as f32) / 3.0);
+        assert!((num_malicious as f32) < (num_nodes as f32) / 3.0);
 
-        let num_good = num_nodes - num_faulty - num_malicious;
+        let num_good = num_nodes - num_malicious;
         let mut nodes = HashMap::new();
         let (tx, network_rx): (Sender<NetworkMessage>, Receiver<NetworkMessage>) = channel();
 
         let mut good_nodes = vec![];
-        let mut faulty_nodes = vec![];
         let mut malicious_nodes = vec![];
         for id in 0..num_nodes {
             let (network_tx, rx): (Sender<NetworkMessage>, Receiver<NetworkMessage>) = channel();
@@ -84,12 +83,9 @@ impl Network {
             let behaviour = if id < num_good {
                 good_nodes.push(id);
                 Behaviour::Good
-            } else if id < num_good + num_faulty {
-                faulty_nodes.push(id);
-                Behaviour::Faulty
             } else {
                 malicious_nodes.push(id);
-                Behaviour::Malicious
+                Behaviour::Malicious(kind.clone())
             };
             let node = Node::new(id, tx.clone(), rx, behaviour, neighbour_nodes);
             nodes.insert(id, (node, network_tx));
@@ -97,8 +93,7 @@ impl Network {
 
         let mut node_behaviours = HashMap::new();
         node_behaviours.insert(Behaviour::Good, good_nodes);
-        node_behaviours.insert(Behaviour::Faulty, faulty_nodes);
-        node_behaviours.insert(Behaviour::Malicious, malicious_nodes);
+        node_behaviours.insert(Behaviour::Malicious(kind), malicious_nodes);
 
         Network {
             num_nodes,
@@ -176,24 +171,14 @@ impl Network {
                                 "Good nodes {:?} have terminated",
                                 self.node_behaviours.get(&Behaviour::Good).unwrap()
                             );
-                            let mut bad_nodes = self
-                                .node_behaviours
-                                .get(&Behaviour::Faulty)
-                                .unwrap()
-                                .clone();
-                            bad_nodes.append(
-                                self.node_behaviours.get_mut(&Behaviour::Malicious).unwrap(),
-                            );
 
                             // Send termination message to all bad nodes
-                            for id in bad_nodes.iter() {
-                                let (_, tx) = self.nodes.get(&id).unwrap();
-                                tx.send(NetworkMessage::new(NETWORK_ID, *id, END(0)));
+                            for (node, tx) in self.nodes.values() {
+                                tx.send(NetworkMessage::new(NETWORK_ID, node.id, END(0)));
                             }
 
                             // Wait for the bad nodes to end
-                            for id in bad_nodes {
-                                let (node, _) = self.nodes.remove(&id).unwrap();
+                            for (node, _) in self.nodes.into_values() {
                                 node.thread.join().unwrap();
                             }
                             break;
@@ -205,15 +190,18 @@ impl Network {
                 _ => {
                     trace!("{:?}", network_msg);
                     if network_msg.to != NETWORK_ID {
-                        let (_, tx) = self.nodes.get(&network_msg.to).expect(&format!(
-                            "[NETWORK ERROR] Trying to send message to terminated node.\n\t{:?}",
-                            network_msg
-                        ));
-                        tx.send(network_msg);
+                        if let Some((_, tx)) = self.nodes.get(&network_msg.to) {
+                            // If the node is still up transmit the message
+                            tx.send(network_msg);
+                        } else {
+                            warn!("Destination node is down: {:?}", network_msg);
+                        }
                     }
                 }
             }
         }
         results
     }
+
+    pub fn close(self) 
 }

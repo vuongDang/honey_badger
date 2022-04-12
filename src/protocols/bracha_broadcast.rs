@@ -2,6 +2,10 @@ use crate::network::{Message::*, *};
 use crate::node::*;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use rand::{
+    distributions::{Distribution, Standard},
+    Rng,
+};
 
 #[derive(Debug)]
 pub(crate) struct BroadcastState {
@@ -31,15 +35,14 @@ pub(crate) enum BroadcastMessage {
 }
 use BroadcastMessage::*;
 
-impl fmt::Debug for BroadcastMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            BC_LEADER(v) => format!("<LEADER, {}>", v),
-            BC_INIT(v) => format!("<INIT, {}>", v),
-            BC_ECHO(v) => format!("<ECHO, {}>", v),
-            BC_READY(v) => format!("<READY, {}>", v),
-        };
-        write!(f, "{}", s)
+impl BroadcastMessage {
+    pub(crate) fn malicious(&self) -> Self {
+        match self {
+            BC_LEADER(_) => BC_LEADER(MALICIOUS_VALUE),
+            BC_INIT(_) => BC_INIT(MALICIOUS_VALUE),
+            BC_ECHO(_) =>BC_ECHO(MALICIOUS_VALUE),
+            BC_READY(_) => BC_ECHO(MALICIOUS_VALUE),
+        }
     }
 }
 
@@ -109,7 +112,7 @@ pub(crate) fn handle_broadcast(
             if node.bc_state.ready {
                 // We haven't sent READY yet
 
-                if ready_v_received.len() > node.max_faulty_nodes {
+                if ready_v_received.len() > node.max_malicious_nodes {
                     // At least one of the READY comes from an honnest node
 
                     node.send_to_all(BROADCAST(BC_READY(v)));
@@ -124,4 +127,41 @@ pub(crate) fn handle_broadcast(
         }
     }
     ProtocolState::InProcess
+}
+
+
+/// Malicious node tries to corrupt the broadcast to
+/// the value MALICIOUS_VALUE by
+/// sending random ECHO and READY messages
+pub(crate) fn random_broadcast(
+    node: &mut NodeInternals,
+    _from: NodeId,
+    _msg: BroadcastMessage,
+) -> ProtocolState {
+    let random_msg: BroadcastMessage = rand::random();
+    node.send_to_all(BROADCAST(random_msg));
+    ProtocolState::InProcess
+}
+
+
+impl fmt::Debug for BroadcastMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            BC_LEADER(v) => format!("<LEADER, {}>", v),
+            BC_INIT(v) => format!("<INIT, {}>", v),
+            BC_ECHO(v) => format!("<ECHO, {}>", v),
+            BC_READY(v) => format!("<READY, {}>", v),
+        };
+        write!(f, "{}", s)
+    }
+}
+
+
+impl Distribution<BroadcastMessage> for Standard {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> BroadcastMessage {
+        match rng.gen_range(0..2usize) { // rand 0.8
+            0 => BC_ECHO(MALICIOUS_VALUE),
+            _ => BC_READY(MALICIOUS_VALUE),
+        }
+    }
 }
